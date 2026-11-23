@@ -1,0 +1,192 @@
+# -*- coding: utf-8 -*-
+#===================================================================================== #
+# [SFM] ReFrame - time mapping and decoder arguments
+#
+# All times are in seconds. This file does not import SFM or Qt.
+# Author: Aftre
+# License: MIT
+# ===================================================================================== #
+
+import bisect, math, struct
+
+
+# -- Time validation --- #
+
+def isFinite(value):
+    return not (math.isnan(value) or math.isinf(value))
+
+
+def frameAtTime(timestamps, seconds):
+    if not timestamps or not isFinite(seconds):
+        raise ValueError('Invalid video time')
+    # SFM stores tenths of milliseconds. Compensate half one tick at boundaries.
+    return max(0, min(len(timestamps) - 1,
+                      bisect.bisect_right(timestamps, seconds + 0.000051) - 1))
+
+
+# == Shot alignment === #
+class Alignment(object):
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.offset = 0.0
+
+    def align(self, head, shotStart, video):
+        self.offset = video - (head - shotStart)
+
+    def target(self, head, shotStart):
+        return head - shotStart + self.offset
+
+
+# -- Reads the current session time --- #
+
+def readSessionTime(app):
+    """Read only; no retained native proxies and no edits to the SFM session."""
+    if not app.HasDocument():
+        return None
+    shot = app.GetShotAtCurrentTime()
+    if shot is None:
+        return None
+    head = float(app.GetHeadTimeInSeconds())
+    fps = float(app.GetFramesPerSecond())
+    start = float(shot.GetStartTime().GetSeconds())
+    if not all(isFinite(t) for t in (head, fps, start)) or fps <= 0:
+        raise ValueError('Invalid SFM time')
+    key = (str(app.GetDocumentRoot().GetId()), str(shot.GetId()))
+    return key, head, start, fps
+
+
+# -- Finds a preceding key packet --- #
+
+def findSeekAnchor(keyPts, keyDts, timestamp):
+    index = bisect.bisect_right(keyPts, timestamp + 0.000001) - 1
+    return keyDts[index] if index >= 0 else None
+
+
+def number(value, default=0.0):
+    try:
+        result = float(value)
+        return result if isFinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def videoMetadata(metadata):
+    if not metadata.get('streams'):
+        raise ValueError('No video stream was found in this file.')
+    stream = metadata['streams'][0]
+    container = metadata.get('format', {})
+    origin = number(stream.get('start_time'))
+    fileOrigin = number(container.get('start_time'))
+    ratio = stream.get('avg_frame_rate', '0/1').split('/')
+    fps = number(ratio[0]) / max(number(ratio[-1]), 1.0)
+    if fps <= 0:
+        ratio = stream.get('r_frame_rate', '25/1').split('/')
+        fps = number(ratio[0], 25.0) / max(number(ratio[-1]), 1.0)
+    fps = max(fps if fps > 0 else 25.0, 0.001)
+    duration = number(stream.get('duration'))
+    if duration <= 0:
+        # Matroska stores an absolute end timestamp in its per-stream DURATION tag.
+        parts = stream.get('tags', {}).get('DURATION', '').split(':')
+        if len(parts) == 3:
+            duration = number(parts[0]) * 3600 + number(parts[1]) * 60 + number(parts[2]) - origin
+    if duration <= 0:
+        duration = number(container.get('duration')) - max(0.0, origin - fileOrigin)
+    if duration <= 0:
+        duration = number(stream.get('nb_frames')) / fps
+    return dict(origin=origin, fileOrigin=fileOrigin,
+                duration=max(0.0, duration), fps=fps,
+                codec=stream.get('codec_name', 'unknown'),
+                width=int(number(stream.get('width'))), height=int(number(stream.get('height'))))
+
+
+def windowArguments(filename, origin, seconds, fps, span=None, packetsOnly=False):
+    # Decode a local interval, including reorder preroll, rather than the whole file.
+    preroll = span if span is not None else max(2.0, 32.0 / fps)
+    # The first display PTS may follow the first key packet's decode timestamp.
+    start = origin + seconds - preroll
+    ahead = max(2.0, 32.0 / fps) if packetsOnly else max(0.5, 2.0 / fps)
+    end = origin + seconds + (span if span is not None else ahead)
+    args = ['-v', 'error', '-threads', '2', '-protocol_whitelist', 'file',
+            '-read_intervals', '%.9f%%%.9f' % (start, end), '-select_streams', 'V:0',
+            '-show_packets']
+    if not packetsOnly:
+        args += ['-show_frames']
+    entries = 'packet=pts_time,dts_time,flags'
+    if not packetsOnly:
+        entries = 'frame=best_effort_timestamp_time:' + entries
+    return args + ['-show_entries', entries,
+            '-of', 'compact=p=1:nk=0', filename]
+
+
+def readWindow(data, origin, packetsOnly=False):
+    times, keyPts, keyDts = [], [], []
+    for line in data.splitlines():
+        if len(line) > 65536:
+            raise ValueError('A video index record is too large.')
+        parts = line.split(b'|')
+        fields = dict(part.split(b'=', 1) for part in parts[1:] if b'=' in part)
+        if parts[0] == b'frame':
+            value = number(fields.get(b'best_effort_timestamp_time'), float('nan'))
+            if not isFinite(value):
+                raise ValueError('A video frame has no valid timestamp.')
+            if value >= origin - 0.000051:
+                if times and value < times[-1]:
+                    raise ValueError('Video timestamps are out of order.')
+                times.append(value)
+        elif parts[0] == b'packet':
+            pts = number(fields.get(b'pts_time'), float('nan'))
+            dts = number(fields.get(b'dts_time'), float('nan'))
+            if packetsOnly:
+                if not isFinite(pts):
+                    raise ValueError('Video packets need decoded timestamps.')
+                if pts >= origin - 0.000051:
+                    times.append(pts)
+            if (b'K' in fields.get(b'flags', b'') and isFinite(pts) and isFinite(dts)
+                and (not keyPts or pts >= keyPts[-1])):
+                keyPts.append(pts)
+                keyDts.append(dts)
+    if packetsOnly:
+        times = sorted(set(times))
+    return times, keyPts, keyDts
+
+
+def timeLabel(seconds):
+    milliseconds = max(0, int(round(seconds * 1000)))
+    return '%02d:%02d:%02d.%03d' % (milliseconds // 3600000,
+        milliseconds // 60000 % 60, milliseconds // 1000 % 60, milliseconds % 1000)
+
+
+# -- Builds video decoder arguments --- #
+
+def decodeArguments(filename, timestamp, anchor=None, fileOrigin=0.0, frameCount=1):
+    args = ['-hide_banner', '-loglevel', 'error', '-nostdin',
+            '-threads', '2', '-copyts']
+    # Seek by a preceding key packet's DTS, then trim using absolute display PTS.
+    # Seeking directly to a B-frame's PTS can land on a later keyframe's DTS.
+    if anchor is not None and anchor > fileOrigin + 0.000002:
+        args += ['-noaccurate_seek', '-ss', '%.9f' % (anchor - fileOrigin - 0.000002)]
+    return args + ['-protocol_whitelist', 'file', '-i', filename,
+            '-ss', '%.9f' % (timestamp - 0.000002),
+            '-map', '0:V:0', '-an', '-sn', '-dn', '-frames:v', str(frameCount),
+            '-vf', "scale=w='max(2,trunc(min(1280,min(iw*sar,720*dar))/2)*2)':"
+                   "h='max(2,trunc(min(720,min(ih,1280/dar))/2)*2)',setsar=1",
+            '-threads', '1', '-c:v', 'bmp', '-fps_mode', 'passthrough',
+            '-f', 'image2pipe', 'pipe:1']
+
+
+def bitmapFrames(data, maximum):
+    offset, count = 0, 0
+    while offset < len(data):
+        if len(data) - offset < 54 or data[offset:offset + 2] != b'BM':
+            raise ValueError('Invalid preview bitmap header.')
+        size = struct.unpack_from('<I', data, offset + 2)[0]
+        width, height = struct.unpack_from('<ii', data, offset + 18)
+        if not (54 <= size <= len(data) - offset and 0 < width <= 1280 and 0 < abs(height) <= 720):
+            raise ValueError('Invalid preview bitmap dimensions or size.')
+        count += 1
+        if count > maximum:
+            raise ValueError('Too many preview bitmaps.')
+        yield data[offset:offset + size]
+        offset += size

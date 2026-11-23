@@ -1,0 +1,185 @@
+# -*- coding: utf-8 -*-
+#===================================================================================== #
+# [SFM] ReFrame - Windows child processes
+#
+# Author: Aftre
+# License: MIT
+# ===================================================================================== #
+
+import ctypes, os, subprocess, threading
+from ctypes import wintypes as wt
+
+_kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+_SIZE = ctypes.c_size_t
+_PTR = ctypes.c_void_p
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [('length', wt.DWORD), ('descriptor', _PTR), ('inherit', wt.BOOL)]
+
+
+class _StartupInfo(ctypes.Structure):
+    _fields_ = [('cb', wt.DWORD), ('reserved', wt.LPWSTR), ('desktop', wt.LPWSTR),
+        ('title', wt.LPWSTR), ('x', wt.DWORD), ('y', wt.DWORD),
+        ('width', wt.DWORD), ('height', wt.DWORD), ('charsX', wt.DWORD),
+        ('charsY', wt.DWORD), ('fill', wt.DWORD), ('flags', wt.DWORD),
+        ('show', wt.WORD), ('reservedSize', wt.WORD), ('reservedBytes', _PTR),
+        ('stdin', wt.HANDLE), ('stdout', wt.HANDLE), ('stderr', wt.HANDLE)]
+
+
+class _StartupInfoEx(ctypes.Structure):
+    _fields_ = [('startup', _StartupInfo), ('attributes', _PTR)]
+
+
+class _ProcessInfo(ctypes.Structure):
+    _fields_ = [('process', wt.HANDLE), ('thread', wt.HANDLE),
+                ('pid', wt.DWORD), ('tid', wt.DWORD)]
+
+
+def _bind(name, arguments, result):
+    function = getattr(_kernel, name)
+    function.argtypes, function.restype = arguments, result
+    return function
+
+
+_createPipe = _bind('CreatePipe', [ctypes.POINTER(wt.HANDLE), ctypes.POINTER(wt.HANDLE),
+                    ctypes.POINTER(_SecurityAttributes), wt.DWORD], wt.BOOL)
+_setHandleInfo = _bind('SetHandleInformation', [wt.HANDLE, wt.DWORD, wt.DWORD], wt.BOOL)
+_closeHandle = _bind('CloseHandle', [wt.HANDLE], wt.BOOL)
+_createFile = _bind('CreateFileW', [wt.LPCWSTR, wt.DWORD, wt.DWORD,
+                    ctypes.POINTER(_SecurityAttributes), wt.DWORD, wt.DWORD, wt.HANDLE], wt.HANDLE)
+_initAttributes = _bind('InitializeProcThreadAttributeList', [_PTR, wt.DWORD, wt.DWORD,
+                    ctypes.POINTER(_SIZE)], wt.BOOL)
+_updateAttributes = _bind('UpdateProcThreadAttribute', [_PTR, wt.DWORD, _SIZE,
+                    _PTR, _SIZE, _PTR, _PTR], wt.BOOL)
+_deleteAttributes = _bind('DeleteProcThreadAttributeList', [_PTR], None)
+_createProcess = _bind('CreateProcessW', [wt.LPCWSTR, wt.LPWSTR, _PTR, _PTR,
+                    wt.BOOL, wt.DWORD, _PTR, wt.LPCWSTR,
+                    ctypes.POINTER(_StartupInfoEx), ctypes.POINTER(_ProcessInfo)], wt.BOOL)
+_readFile = _bind('ReadFile', [wt.HANDLE, _PTR, wt.DWORD, ctypes.POINTER(wt.DWORD), _PTR], wt.BOOL)
+_wait = _bind('WaitForSingleObject', [wt.HANDLE, wt.DWORD], wt.DWORD)
+_exitCode = _bind('GetExitCodeProcess', [wt.HANDLE, ctypes.POINTER(wt.DWORD)], wt.BOOL)
+_terminate = _bind('TerminateProcess', [wt.HANDLE, wt.UINT], wt.BOOL)
+
+
+def _check(result):
+    if not result:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return result
+
+
+# -- Unicode process launch and bounded pipe readers --- #
+
+class Command(object):
+    def __init__(self, executable, arguments, outputLimit):
+        self.lock = threading.RLock()
+        self.handle = None
+        self.stdout = []
+        self.stderr = b''
+        self.outputSize = 0
+        self.limit = outputLimit
+        self.failure = ''
+        self.cancelled = False
+        self.finishedPipes = 0
+        self.threads = []
+        handles = []
+        attributes = None
+        initialized = False
+        info = _ProcessInfo()
+        try:
+            security = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), None, True)
+            outRead, outWrite = wt.HANDLE(), wt.HANDLE()
+            errRead, errWrite = wt.HANDLE(), wt.HANDLE()
+            for read, write in ((outRead, outWrite), (errRead, errWrite)):
+                _check(_createPipe(ctypes.byref(read), ctypes.byref(write), ctypes.byref(security), 65536))
+                handles.extend([read.value, write.value])
+                _check(_setHandleInfo(read, 1, 0))
+            null = _createFile(u'NUL', 0x80000000, 3, ctypes.byref(security), 3, 0, None)
+            if null == wt.HANDLE(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            handles.append(null)
+            size = _SIZE()
+            _initAttributes(None, 1, 0, ctypes.byref(size))
+            attributes = ctypes.create_string_buffer(size.value)
+            _check(_initAttributes(attributes, 1, 0, ctypes.byref(size)))
+            initialized = True
+            inherited = (wt.HANDLE * 3)(null, outWrite.value, errWrite.value)
+            # Inherit only these pipes, never arbitrary handles owned by SFM.
+            _check(_updateAttributes(attributes, 0, 0x20002,
+                                    inherited, ctypes.sizeof(inherited), None, None))
+            startup = _StartupInfoEx()
+            startup.startup.cb = ctypes.sizeof(startup)
+            startup.startup.flags = 0x100 | 1  # Standard handles, hidden window.
+            startup.startup.stdin = null
+            startup.startup.stdout = outWrite.value
+            startup.startup.stderr = errWrite.value
+            startup.attributes = ctypes.cast(attributes, _PTR)
+            command = ctypes.create_unicode_buffer(subprocess.list2cmdline([executable] + arguments))
+            _check(_createProcess(executable, command, None, None, True,
+                0x08000000 | 0x00080000, None, os.path.dirname(executable),
+                ctypes.byref(startup), ctypes.byref(info)))
+            self.handle = info.process
+            _closeHandle(info.thread)
+            for pipe, isError in ((outRead.value, False), (errRead.value, True)):
+                thread = threading.Thread(target=self._read, args=(pipe, isError))
+                thread.daemon = True
+                thread.start()
+                self.threads.append(thread)
+                handles.remove(pipe)
+        except Exception:
+            self.cancel()
+            raise
+        finally:
+            if initialized:
+                _deleteAttributes(attributes)
+            for handle in handles:
+                _closeHandle(handle)
+
+    def _read(self, handle, isError):
+        buffer = ctypes.create_string_buffer(65536)
+        count = wt.DWORD()
+        try:
+            while _readFile(handle, buffer, len(buffer), ctypes.byref(count), None) and count.value:
+                data = buffer.raw[:count.value]
+                with self.lock:
+                    if self.cancelled:
+                        continue
+                    if isError:
+                        self.stderr = (self.stderr + data)[-8192:]
+                    elif self.outputSize + len(data) <= self.limit:
+                        self.stdout.append(data)
+                        self.outputSize += len(data)
+                    else:
+                        self.failure = 'The decoder output exceeded the per-request memory limit.'
+                        if self.handle:
+                            _terminate(self.handle, 1)
+        finally:
+            _closeHandle(handle)
+            with self.lock:
+                self.finishedPipes += 1
+
+    def result(self):
+        with self.lock:
+            if not self.handle or _wait(self.handle, 0) != 0 or self.finishedPipes != 2:
+                return None
+            code = wt.DWORD()
+            _check(_exitCode(self.handle, ctypes.byref(code)))
+            _closeHandle(self.handle)
+            self.handle = None
+            data = b''.join(self.stdout)
+            self.stdout = []
+            return code.value, data, self.stderr, self.failure
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled = True
+            if self.handle:
+                _terminate(self.handle, 1)
+                _closeHandle(self.handle)
+                self.handle = None
+            self.stdout = []
+
+    def close(self):
+        self.cancel()
+        for thread in self.threads:
+            thread.join(0.25)

@@ -1,0 +1,17 @@
+# Local review prompts and their instruction loader.
+/.local-checks/
+/AGENTS.md
+
+# Python compilation artifacts.
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated runtime binaries and release artifacts; build from pinned source.
+/scripts/sfm/mainmenu/aftre/reframe/runtime/bin/
+/scripts/sfm/mainmenu/aftre/reframe/runtime/manifest.json
+/dist/
+/build/
+
+# Local regression videos; never include third-party samples in source releases.
+/tests/fixtures/

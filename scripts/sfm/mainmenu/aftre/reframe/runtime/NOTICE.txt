@@ -1,0 +1,14 @@
+ReFrame uses FFmpeg 8.0.3, Copyright (c) the FFmpeg developers.
+FFmpeg is free software under LGPL version 2.1 or later; see LICENSE.txt.
+No FFmpeg source modifications. Includes the static dav1d AV1 decoder
+version 1.5.4 (BSD-2-Clause); see dav1d-LICENSE.txt and manifest.json.
+Source: https://ffmpeg.org/releases/ffmpeg-8.0.3.tar.xz
+Corresponding source and build scripts: ReFrame-sources.zip, supplied
+alongside ReFrame.zip at the same download location. Redistributors must
+provide this source sidecar with their binary download.
+Configuration, compiler and library versions: manifest.json, build_details.
+Exact source and binary SHA-256: manifest.json.
+The executables can be replaced with compatible modified LGPL builds;
+ReFrame does not prohibit modification or reverse engineering.
+Includes Microsoft C runtime code under its redistributable terms.
+No compiler, development Make, VLC or Keyframe binaries are included.

@@ -1,0 +1,1384 @@
+# -*- coding: utf-8 -*-
+#===================================================================================== #
+# [SFM] ReFrame v1.0.0 - video reader and reference window
+#
+# Author: Aftre
+# License: MIT
+# ===================================================================================== #
+
+import os, json, time, re
+from collections import OrderedDict
+from PySide import QtCore, QtGui
+import sfmApp
+
+ProductName = "ReFrame v1.0.0"
+InternalName = "aftre_reframe"
+ToolDirectory = os.path.dirname(__file__)
+_window = None
+
+# -- Window style --- #
+
+def applyWindowStyle(window):
+    # Read the host font through QObject properties too; SFM can return a generic wrapper.
+    font = QtGui.QFont(QtGui.QApplication.font())
+    main = sfmApp.GetMainWindow()
+    if main is not None:
+        nativeFont = main.property('font')
+        if isinstance(nativeFont, QtGui.QFont):
+            font = QtGui.QFont(nativeFont)
+    # Qt4 can lose the Windows font alias when a stylesheet changes pixel size.
+    if font.family() == 'MS Shell Dlg 2':
+        font.setFamily('Tahoma')
+    elif font.family() == 'MS Shell Dlg':
+        font.setFamily('Microsoft Sans Serif')
+    font.setPixelSize(11)
+    window.setFont(font)
+    family = font.family().replace('\\', '\\\\').replace('"', '\\"')
+    window.setStyleSheet(u'''
+        QWidget { background: transparent; border-image: none; color: #dddddd; font-family: "%s"; font-size: 11px; }
+        ReFrameWindow, OverlayHandle, QDialog, QMessageBox { background: #282828; }
+        QLabel { background: transparent; border-image: none; padding: 0; }
+        QPushButton, QToolButton {
+            background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #494949, stop: 1 #2d2d2d);
+            border: 1px solid #202020; border-top-color: #606060; border-left-color: #505050;
+            border-radius: 2px;
+        }
+        QPushButton { padding: 4px 12px; }
+        QToolButton { padding: 0; }
+        QPushButton:hover:enabled, QToolButton:hover:enabled {
+            background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #606060, stop: 1 #3c3c3c);
+            border-top-color: #888888; border-left-color: #606060; color: #ffffff;
+        }
+        QToolButton:checked:enabled {
+            background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #202020, stop: 1 #3c4650);
+            border-color: #202020; border-bottom-color: #718095;
+        }
+        QPushButton:pressed:enabled, QToolButton:pressed:enabled {
+            background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #202020, stop: 1 #3c3c3c);
+            border-color: #202020; border-bottom-color: #606060;
+        }
+        QPushButton:focus, QToolButton:focus { border-color: #888888; }
+        QPushButton:disabled, QToolButton:disabled { background: #2e2e2e; border-color: #3c3c3c; }
+        QLabel#Muted { color: #aaaaaa; font-size: 11px; }
+        QSlider::groove:horizontal { background: #202020; border: 1px solid #505050; border-top-color: #202020; height: 5px; }
+        QSlider::sub-page:horizontal { background: rgba(60, 90, 120, 180); }
+        QSlider::handle:horizontal {
+            background: qlineargradient(x1: 0, y1: 0, x2: 0, y2: 1, stop: 0 #888888, stop: 1 #505050);
+            border: 1px solid #202020; border-top-color: #aaaaaa; border-left-color: #888888;
+            width: 10px; margin: -4px 0;
+        }
+        QSlider::handle:horizontal:hover { background: #888888; }
+        QSlider::handle:horizontal:pressed { background: #718095; }
+        QSlider::groove:horizontal:disabled { background: #2e2e2e; border-color: #3c3c3c; }
+        QSlider::sub-page:horizontal:disabled { background: #383838; }
+        QSlider::handle:horizontal:disabled { background: #3c3c3c; border-color: #505050; }
+        QToolButton::menu-indicator { image: none; }
+        QMenu { background: #303030; border: 1px solid #606060; padding: 4px; }
+        QMenu::item { padding: 6px 18px; }
+        QMenu::item:selected { background: #3c4650; }
+        QMenu::item:disabled { color: #777777; }
+        QMenu::separator { height: 1px; background: #505050; margin: 4px; }
+        QLineEdit { background: #202020; border: 1px solid #505050; border-top-color: #202020; border-left-color: #202020; padding: 3px; selection-background-color: #3c5a78; }
+        QLineEdit#ShotTime { font-size: 14px; }
+        QTabWidget::pane { background: #282828; border: 1px solid #505050; }
+        QTabBar::tab { background: #303030; padding: 5px 12px; border: 1px solid #505050; }
+        QTabBar::tab:!selected { margin-top: 2px; color: #aaaaaa; }
+        QTabBar::tab:selected { background: #3c4650; border-top-color: #888888; }
+        QTreeWidget { background: #282828; border: 0; outline: 0; }
+        QHeaderView::section { background: #333333; padding: 5px; border: 0; }
+        QWidget:disabled { color: #777777; }
+    ''' % family)
+
+
+# -- Solid toolbar icons; no font glyphs or external image plugins --- #
+
+def makeIcon(name):
+    pixmap = QtGui.QPixmap(20, 20)
+    pixmap.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing)
+    shape = QtGui.QPainterPath()
+
+    def polygon(points):
+        path = QtGui.QPainterPath()
+        path.addPolygon(QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in points]))
+        path.closeSubpath()
+        return path
+
+    def rectangle(x, y, width, height):
+        path = QtGui.QPainterPath()
+        path.addRect(x, y, width, height)
+        return path
+
+    def ellipse(x, y, width, height):
+        path = QtGui.QPainterPath()
+        path.addEllipse(x, y, width, height)
+        return path
+
+    if name == 'open':
+        shape = polygon([(2, 5), (8, 5), (10, 7), (17, 7), (17, 9), (4, 9), (3, 16), (2, 16)])
+        shape = shape.united(polygon([(5, 10), (19, 10), (16, 17), (3, 17)]))
+    elif name == 'close':
+        shape = polygon([(5, 3), (10, 8), (15, 3), (17, 5), (12, 10), (17, 15),
+                         (15, 17), (10, 12), (5, 17), (3, 15), (8, 10), (3, 5)])
+    elif name in ('help', 'info'):
+        shape = ellipse(2, 2, 16, 16)
+        if name == 'info':
+            cutout = rectangle(9, 8, 2, 7).united(rectangle(9, 5, 2, 2))
+        else:
+            question = QtGui.QPainterPath(QtCore.QPointF(7, 7))
+            question.cubicTo(7, 3, 16, 5, 11, 9)
+            question.lineTo(10, 12)
+            stroke = QtGui.QPainterPathStroker()
+            stroke.setWidth(2)
+            cutout = stroke.createStroke(question).united(rectangle(9, 14, 2, 2))
+        shape = shape.subtracted(cutout)
+    elif name in ('first', 'previous', 'next', 'last'):
+        if name in ('first', 'last'):
+            shape = polygon([(10, 4), (2, 10), (10, 16)])
+            shape = shape.united(polygon([(18, 4), (10, 10), (18, 16)]))
+        else:
+            shape = rectangle(3, 4, 3, 12).united(polygon([(16, 4), (7, 10), (16, 16)]))
+        if name in ('next', 'last'):
+            transform = QtGui.QTransform(-1, 0, 0, 1, 20, 0)
+            shape = transform.map(shape)
+    elif name == 'follow':
+        for x in (2, 9):
+            link = QtGui.QPainterPath()
+            link.addRoundedRect(QtCore.QRectF(x, 6, 9, 8), 3, 3)
+            shape = shape.united(link.subtracted(rectangle(x + 3, 9, 3, 2)))
+        shape = shape.united(rectangle(7, 9, 6, 2))
+        transform = QtGui.QTransform()
+        transform.translate(10, 10)
+        transform.rotate(-40)
+        transform.translate(-10, -10)
+        shape = transform.map(shape)
+    elif name == 'align':
+        shape = ellipse(4, 4, 12, 12).subtracted(ellipse(7, 7, 6, 6))
+        for x, y, w, h in ((9, 1, 2, 5), (9, 14, 2, 5), (1, 9, 5, 2), (14, 9, 5, 2)):
+            shape = shape.united(rectangle(x, y, w, h))
+        shape = shape.united(rectangle(9, 9, 2, 2))
+    elif name == 'reset':
+        arc = QtGui.QPainterPath()
+        arc.arcMoveTo(4, 4, 12, 12, 45)
+        arc.arcTo(4, 4, 12, 12, 45, 290)
+        stroke = QtGui.QPainterPathStroker()
+        stroke.setWidth(3)
+        shape = stroke.createStroke(arc).united(polygon([(16, 2), (16, 9), (10, 6)]))
+    elif name == 'mirror':
+        shape = rectangle(9, 2, 2, 16)
+        shape = shape.united(polygon([(1, 15), (7, 4), (7, 15)]))
+        shape = shape.united(polygon([(19, 15), (13, 4), (13, 15)]))
+    elif name == 'fit':
+        shape = rectangle(2, 3, 16, 14).subtracted(rectangle(4, 5, 12, 10))
+        shape = shape.subtracted(rectangle(7, 0, 6, 20)).subtracted(rectangle(0, 8, 20, 4))
+        shape = shape.united(rectangle(6, 7, 8, 6))
+    elif name == 'focus':
+        arrow = polygon([(12, 2), (18, 2), (18, 8), (16, 6), (13, 9), (11, 7), (14, 4)])
+        for angle in (0, 90, 180, 270):
+            transform = QtGui.QTransform()
+            transform.translate(10, 10)
+            transform.rotate(angle)
+            transform.translate(-10, -10)
+            shape = shape.united(transform.map(arrow))
+    elif name == 'clicks':
+        shape = polygon([(4, 2), (4, 17), (8, 13), (11, 19), (14, 18), (11, 12), (17, 12)])
+    elif name == 'opacity':
+        shape = ellipse(3, 3, 14, 14).subtracted(ellipse(5, 5, 10, 10))
+        shape = shape.united(ellipse(3, 3, 14, 14).intersected(rectangle(3, 3, 7, 14)))
+    shade = QtGui.QLinearGradient(0, 2, 0, 18)
+    shade.setColorAt(0, QtGui.QColor('#dddddd'))
+    shade.setColorAt(1, QtGui.QColor('#aaaaaa'))
+    painter.setPen(QtGui.QPen(QtGui.QColor('#202020'), 0.7))
+    painter.setBrush(shade)
+    painter.drawPath(shape)
+    painter.end()
+    disabled = QtGui.QPixmap(20, 20)
+    disabled.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(disabled)
+    painter.setOpacity(0.3)
+    painter.drawPixmap(0, 0, pixmap)
+    painter.end()
+    icon = QtGui.QIcon(pixmap)
+    icon.addPixmap(disabled, QtGui.QIcon.Disabled, QtGui.QIcon.Off)
+    icon.addPixmap(disabled, QtGui.QIcon.Disabled, QtGui.QIcon.On)
+    return icon
+
+
+def iconButton(symbol, title, description, checkable=False):
+    button = QtGui.QToolButton()
+    button.setIcon(makeIcon(symbol))
+    button.setIconSize(QtCore.QSize(20, 20))
+    button.setFixedSize(30, 30)
+    button.setCheckable(checkable)
+    button.setToolTip(title.split(u' (')[0])
+    button.setAccessibleName(title)
+    button.setAccessibleDescription(description)
+    return button
+
+
+class ElidedLabel(QtGui.QLabel):
+    def __init__(self, text='', parent=None):
+        super(ElidedLabel, self).__init__(text, parent)
+        self.setAlignment(QtCore.Qt.AlignCenter)
+        self.setSizePolicy(QtGui.QSizePolicy.Ignored, QtGui.QSizePolicy.Preferred)
+        self.setMinimumWidth(0)
+        self.setTextFormat(QtCore.Qt.PlainText)
+
+    def setText(self, text):
+        if text == self.text():
+            return
+        super(ElidedLabel, self).setText(text)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setPen(self.palette().color(QtGui.QPalette.WindowText))
+        text = self.fontMetrics().elidedText(self.text(), QtCore.Qt.ElideMiddle, self.width())
+        painter.drawText(self.rect(), self.alignment(), text)
+
+
+class TitleTip(QtGui.QLabel):
+    def __init__(self, owner):
+        super(TitleTip, self).__init__(owner, QtCore.Qt.ToolTip)
+        self.setObjectName('TitleTip')
+        self.setTextFormat(QtCore.Qt.PlainText)
+        self.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents)
+        font = QtGui.QFont(owner.font())
+        font.setPixelSize(11)
+        font.setBold(False)
+        self.setFont(font)
+        self.setStyleSheet('QLabel#TitleTip { color: #eeeeee; background: #383838; border: 1px solid #777777; padding: 5px 7px; font-size: 11px; font-weight: normal; }')
+        self.timer = QtCore.QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.dismiss)
+
+    def showTitle(self, title, point):
+        self.setText(title)
+        self.ensurePolished()
+        self.adjustSize()
+        screen = QtGui.QApplication.desktop().availableGeometry(point)
+        x = max(screen.left() + 2, min(point.x() + 12, screen.right() - self.width() - 2))
+        y = max(screen.top() + 2, min(point.y() + 16, screen.bottom() - self.height() - 2))
+        self.move(x, y)
+        self.show()
+        self.timer.start(5000)
+
+    def dismiss(self):
+        self.timer.stop()
+        self.hide()
+
+
+class ShotClock(object):
+    def __init__(self):
+        self.label = None
+        self.lastSearch = -1.0
+
+    def read(self, session):
+        # Native viewport time labels are QLabel subclasses, including QObject wrappers.
+        if session is None:
+            return u'--'
+        try:
+            if self.label is not None and not self.label.property('visible'):
+                self.label = None
+            if self.label is None and time.time() - self.lastSearch >= 1.0:
+                self.lastSearch = time.time()
+                main = sfmApp.GetMainWindow()
+                if main is not None:
+                    for name in ('Primary Viewport Shot Time', 'Secondary Viewport Shot Time'):
+                        label = main.findChild(QtGui.QLabel, name)
+                        if label is not None and label.property('visible'):
+                            self.label = label
+                            break
+                    if self.label is None:
+                        for label in QtGui.QApplication.allWidgets():
+                            if label.metaObject().className() != 'CQSFMTimeLabel' or not label.isVisible():
+                                continue
+                            name = label.objectName() or label.windowTitle()
+                            if name in ('Primary Viewport Shot Time', 'Secondary Viewport Shot Time') or 'Local Shot Time' in label.toolTip():
+                                self.label = label
+                                break
+            if session is not None and self.label is not None:
+                text = re.sub(r'<[^>]*>', '', self.label.property('text')[:128]).strip()
+                if len(text) <= 48 and re.match(r'^-?[0-9][0-9:., ]*$', text):
+                    return text
+        except (RuntimeError, TypeError, AttributeError):
+            self.label = None
+        seconds = session[1] - session[2]
+        return (u'-' if seconds < 0 else u'') + timeline.timeLabel(abs(seconds))
+
+
+class ControlsDialog(QtGui.QDialog):
+    def __init__(self, owner):
+        super(ControlsDialog, self).__init__(owner)
+        self.setWindowTitle(u'ReFrame controls')
+        self.resize(500, 350)
+        self.setMinimumSize(430, 340)
+        layout = QtGui.QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        tabs = QtGui.QTabWidget()
+        workflow = QtGui.QWidget()
+        steps = QtGui.QVBoxLayout(workflow)
+        steps.setContentsMargins(14, 14, 14, 14)
+        steps.setSpacing(18)
+        for symbol, title, text in (
+            ('open', u'1. Open a video', u'Click the viewer or the folder button.'),
+            ('previous', u'2. Choose a pose', u'Click the video timeline or step through frames. Following pauses automatically.'),
+            ('align', u'3. Align with SFM', u'Move the SFM playhead to the matching pose, then click the target button.')):
+            row = QtGui.QHBoxLayout()
+            icon = QtGui.QLabel()
+            icon.setPixmap(makeIcon(symbol).pixmap(20, 20))
+            icon.setFixedSize(28, 28)
+            icon.setAlignment(QtCore.Qt.AlignCenter)
+            row.addWidget(icon, 0, QtCore.Qt.AlignTop)
+            column = QtGui.QVBoxLayout()
+            heading = QtGui.QLabel(title)
+            font = QtGui.QFont(owner.font())
+            font.setPixelSize(11)
+            heading.setFont(font)
+            description = QtGui.QLabel(text)
+            description.setObjectName('Muted')
+            description.setWordWrap(True)
+            column.addWidget(heading)
+            column.addWidget(description)
+            row.addLayout(column, 1)
+            steps.addLayout(row)
+        note = QtGui.QLabel(u'Center: SFM Local Shot Time\nTimeline: reference video time')
+        note.setObjectName('Muted')
+        steps.addStretch(1)
+        steps.addWidget(note)
+        tabs.addTab(workflow, u'Quick start')
+        shortcuts = QtGui.QTreeWidget()
+        shortcuts.setFont(owner.font())
+        shortcuts.setHeaderLabels([u'Action', u'Shortcut'])
+        shortcuts.setRootIsDecorated(False)
+        shortcuts.setIndentation(10)
+        shortcuts.setSelectionMode(QtGui.QAbstractItemView.NoSelection)
+        shortcuts.header().setResizeMode(0, QtGui.QHeaderView.Stretch)
+        shortcuts.header().setResizeMode(1, QtGui.QHeaderView.ResizeToContents)
+        shortcuts.header().setFont(owner.font())
+        for group, rows in (
+            (u'Reference', [(u'Open / close video', u'Ctrl+O / Ctrl+W'), (u'Previous / next frame', u'Left / Right'), (u'First / last frame', u'Home / End')]),
+            (u'Synchronization', [(u'Follow SFM', u'F'), (u'Align to playhead', u'A'), (u'Reset alignment', u'R')]),
+            (u'View', [(u'Mirror / fit', u'M / 0'), (u'Zoom / pan', u'Wheel / drag'), (u'Fit image', u'Double-click'), (u'Focus view / restore controls', u'Ctrl+Space / Esc'), (u'Information / this guide', u'Ctrl+I / F1')])):
+            category = QtGui.QTreeWidgetItem(shortcuts, [group, ''])
+            category.setForeground(0, QtGui.QBrush(QtGui.QColor('#aaaaaa')))
+            category.setFlags(QtCore.Qt.ItemIsEnabled)
+            for action, key in rows:
+                item = QtGui.QTreeWidgetItem(category, [action, key])
+                item.setFlags(QtCore.Qt.ItemIsEnabled)
+            category.setExpanded(True)
+        tabs.addTab(shortcuts, u'Shortcuts')
+        layout.addWidget(tabs)
+        buttons = QtGui.QDialogButtonBox(QtGui.QDialogButtonBox.Close)
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
+        applyWindowStyle(self)
+
+
+class VideoSlider(QtGui.QSlider):
+    def __init__(self, parent=None):
+        super(VideoSlider, self).__init__(QtCore.Qt.Horizontal, parent)
+        self.setRange(0, 100000)
+        self.setMouseTracking(True)
+        self.duration = 0.0
+
+    def _valueAt(self, x):
+        return QtGui.QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+            max(0, min(self.width() - 12, x - 6)), max(1, self.width() - 12))
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.setSliderDown(True)
+            self.setValue(self._valueAt(event.x()))
+            event.accept()
+        else:
+            super(VideoSlider, self).mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & QtCore.Qt.LeftButton:
+            self.setValue(self._valueAt(event.x()))
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.setSliderDown(False)
+            event.accept()
+        else:
+            super(VideoSlider, self).mouseReleaseEvent(event)
+
+
+def sfmWindowParent():
+    # SFM can expose its main window as a generic QObject wrapper.
+    parent = sfmApp.GetMainWindow()
+    return parent if isinstance(parent, QtGui.QWidget) else None
+
+
+def nativeWindowHandle(widget):
+    import ctypes
+    handle = widget.winId()
+    try:
+        return int(handle)
+    except TypeError:
+        # PySide 1.2 exposes WId as PyCObject on SFM's Python 2.7.
+        unwrap = ctypes.pythonapi.PyCObject_AsVoidPtr
+        unwrap.argtypes = [ctypes.py_object]
+        unwrap.restype = ctypes.c_void_p
+        return unwrap(handle)
+
+
+# == Video display === #
+class VideoSurface(QtGui.QWidget):
+    openRequested = QtCore.Signal()
+    zoomChanged = QtCore.Signal(float)
+
+    def __init__(self, parent=None):
+        super(VideoSurface, self).__init__(parent)
+        self.image = QtGui.QImage()
+        self.zoom = 1.0
+        self.pan = QtCore.QPointF()
+        self.mirrored = False
+        self.dragPosition = None
+        self.setMinimumSize(240, 135)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setAccessibleName(u'Video reference')
+
+    def imageRect(self):
+        if self.image.isNull():
+            return QtCore.QRectF()
+        scale = min(float(self.width()) / self.image.width(),
+                    float(self.height()) / self.image.height()) * self.zoom
+        width, height = self.image.width() * scale, self.image.height() * scale
+        return QtCore.QRectF((self.width() - width) / 2 + self.pan.x(),
+                            (self.height() - height) / 2 + self.pan.y(), width, height)
+
+    def fit(self):
+        self.zoom = 1.0
+        self.pan = QtCore.QPointF()
+        self.dragPosition = None
+        self.setCursor(QtCore.Qt.ArrowCursor)
+        self.zoomChanged.emit(self.zoom)
+        self.update()
+
+    def setMirrored(self, enabled):
+        self.mirrored = enabled
+        self.update()
+
+    def _clampPan(self):
+        target = self.imageRect()
+        horizontal = max(0.0, (target.width() - self.width()) / 2)
+        vertical = max(0.0, (target.height() - self.height()) / 2)
+        self.pan = QtCore.QPointF(max(-horizontal, min(horizontal, self.pan.x())),
+                                 max(-vertical, min(vertical, self.pan.y())))
+
+    def resizeEvent(self, event):
+        self._clampPan()
+        super(VideoSurface, self).resizeEvent(event)
+
+    def wheelEvent(self, event):
+        if self.image.isNull():
+            event.ignore()
+            return
+        previous = self.zoom
+        self.zoom = max(1.0, min(8.0, self.zoom * 1.2 ** (event.delta() / 120.0)))
+        cursor = QtCore.QPointF(event.pos()) - QtCore.QPointF(self.width() / 2.0, self.height() / 2.0)
+        self.pan = cursor - (cursor - self.pan) * (self.zoom / previous)
+        self._clampPan()
+        self.setCursor(QtCore.Qt.OpenHandCursor if self.zoom > 1 else QtCore.Qt.ArrowCursor)
+        self.zoomChanged.emit(self.zoom)
+        self.update()
+        event.accept()
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            self.setFocus()
+            self.dragPosition = event.pos()
+            if self.zoom > 1:
+                self.setCursor(QtCore.Qt.ClosedHandCursor)
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.dragPosition is not None and self.zoom > 1:
+            self.pan += QtCore.QPointF(event.pos() - self.dragPosition)
+            self.dragPosition = event.pos()
+            self._clampPan()
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.LeftButton:
+            if self.image.isNull() and self.dragPosition is not None:
+                self.openRequested.emit()
+            self.dragPosition = None
+            self.setCursor(QtCore.Qt.OpenHandCursor if self.zoom > 1 else QtCore.Qt.ArrowCursor)
+            event.accept()
+
+    def mouseDoubleClickEvent(self, event):
+        if not self.image.isNull():
+            self.fit()
+            event.accept()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtCore.Qt.black)
+        if not self.image.isNull():
+            target = self.imageRect()
+            painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
+            if self.mirrored:
+                painter.translate(target.left() + target.right(), 0)
+                painter.scale(-1, 1)
+            painter.drawImage(target, self.image)
+        else:
+            painter.setPen(QtGui.QColor('#aaaaaa'))
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, u'Click to open a video')
+
+
+# == Overlay recovery === #
+class OverlayHandle(QtGui.QWidget):
+    def __init__(self, owner):
+        super(OverlayHandle, self).__init__(sfmWindowParent(),
+                              QtCore.Qt.Tool | QtCore.Qt.WindowStaysOnTopHint)
+        self.setObjectName(InternalName + '_overlay')
+        self.owner = owner
+        self.setWindowTitle(ProductName)
+        layout = QtGui.QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        button = QtGui.QPushButton(u'Restore controls')
+        button.setIcon(makeIcon('clicks'))
+        button.setMinimumHeight(26)
+        button.setToolTip(u'Restore controls')
+        button.clicked.connect(owner.restoreControls)
+        layout.addWidget(button)
+        applyWindowStyle(self)
+        owner.installTitleTips(self)
+
+    def closeEvent(self, event):
+        self.owner.restoreControls()
+        event.accept()
+
+
+# == Asynchronous video reader === #
+class VideoReader(QtCore.QObject):
+    opened = QtCore.Signal()
+    frameReady = QtCore.Signal(float, object)
+    failed = QtCore.Signal(object)
+
+    def __init__(self, parent=None):
+        super(VideoReader, self).__init__(parent)
+        self.command = None
+        self.phase = 'idle'
+        self.closed = False
+        self.cancelled = False
+        self.ready = False
+        self.filename = ''
+        self.info = {}
+        self.duration, self.origin, self.fileOrigin, self.fps = 0.0, 0.0, 0.0, 25.0
+        self.times, self.keyPts, self.keyDts = [], [], []
+        self.desired, self.active, self.shown = None, None, None
+        self.stepping = None
+        self.batchTimes = []
+        self.batchLimit = 12
+        self.previewBytes = 1280 * 720 * 4 + 1024
+        self.probeBounds = (0.0, 0.0)
+        self.windowStart, self.windowEnd = 0.0, 0.0
+        self.firstTime = None
+        self.fastPackets = False
+        self.forward = True
+        self.imageCache = OrderedDict()
+        self.cacheBytes = 0
+        self.details = ''
+        self.message = ''
+        self.started = 0.0
+        self.poll = QtCore.QTimer(self)
+        self.poll.setInterval(8)
+        self.poll.timeout.connect(self._pollCommand)
+        self.delay = QtCore.QTimer(self)
+        self.delay.setSingleShot(True)
+        self.delay.setInterval(8)
+        self.delay.timeout.connect(self._seek)
+
+    def _binaryPath(self, name):
+        path = os.path.join(ToolDirectory, 'runtime', 'bin', name + '.exe')
+        if not os.path.isfile(path):
+            raise IOError('Missing %s.exe. Extract the complete ReFrame ZIP again.' % name)
+        return path
+
+    def _launch(self, name, arguments, phase, limit):
+        self.phase = phase
+        self.started = time.time()
+        try:
+            self.command = native.Command(self._binaryPath(name), arguments, limit)
+            self.poll.start()
+        except Exception as error:
+            self._fail(u'Could not start the video reader: %s' % error)
+
+    def open(self, filename):
+        self.filename = filename
+        if not os.path.isabs(filename) or not os.path.isfile(filename):
+            self._fail(u'Choose an existing local video file.')
+            return
+        self.message = u'Opening video...'
+        self._launch('ffprobe', ['-v', 'error', '-protocol_whitelist', 'file',
+            '-select_streams', 'V:0', '-show_streams', '-show_format',
+            '-show_entries', 'stream=codec_name,start_time,duration,avg_frame_rate,r_frame_rate,nb_frames,width,height:stream_tags=DURATION:format=start_time,duration',
+            '-of', 'json', filename], 'metadata', 1048576)
+
+    def _pollCommand(self):
+        if self.closed or self.command is None:
+            return
+        result = self.command.result()
+        if result is None:
+            if time.time() - self.started > 10:
+                self.message = u'Still reading the video. Choose another file or close the reference.'
+            return
+        self.command.close()
+        self.command = None
+        self.poll.stop()
+        code, data, errors, failure = result
+        if code or failure:
+            self.details = errors.decode('utf-8', 'replace').strip()
+            if failure and self.phase == 'decode' and len(self.batchTimes) > 1:
+                self.batchLimit = max(1, len(self.batchTimes) // 2)
+                self._decode()
+                return
+            if self.phase == 'decode' and self.fastPackets and not failure:
+                self._decodedTimestamps()
+                return
+            if failure:
+                self.details = failure + '\n' + self.details
+            self._fail(u'Could not read this video. See Details for the decoder message.')
+            return
+        try:
+            if self.phase == 'metadata':
+                self.info = timeline.videoMetadata(json.loads(data.decode('utf-8')))
+                self.duration, self.origin = self.info['duration'], self.info['origin']
+                self.fileOrigin, self.fps = self.info['fileOrigin'], self.info['fps']
+                self.fastPackets = self.info['codec'] in (
+                    'h264', 'hevc', 'av1', 'vp8', 'vp9', 'mpeg1video', 'mpeg2video',
+                    'mpeg4', 'mjpeg', 'prores', 'dnxhd', 'ffv1', 'wmv1', 'wmv2', 'wmv3')
+                self.ready = True
+                self.phase = 'ready'
+                self.opened.emit()
+                return
+            if self.phase == 'window':
+                self.times, self.keyPts, self.keyDts = timeline.readWindow(data, self.origin, self.fastPackets)
+                if not self.times:
+                    self._fail(u'No readable frame was found at this position.')
+                    return
+                if self.windowStart <= 0:
+                    self.firstTime = max(0.0, self.times[0] - self.origin)
+                if self.stepping is not None:
+                    direction, base, span = self.stepping
+                    adjacent = [value for value in self.times if direction * (value - base) > 0.000051]
+                    if adjacent:
+                        self.desired = (adjacent[0] if direction > 0 else adjacent[-1]) - self.origin
+                        self.stepping = None
+                    else:
+                        remaining = self.duration - (base - self.origin) if direction > 0 else base - self.origin
+                        if span < remaining:
+                            self.stepping = (direction, base, span * 2)
+                            self._stepWindow()
+                            return
+                        self.stepping = None
+                        self.phase, self.message = 'ready', ''
+                        return
+                self._decode()
+                return
+            if self.phase == 'decode':
+                self._finishDecode(data)
+        except (ValueError, KeyError, IndexError, TypeError) as error:
+            if self.fastPackets and self.phase in ('window', 'decode'):
+                self._decodedTimestamps()
+                return
+            self._fail(u'Could not read the video information: %s' % error)
+
+    def _decodedTimestamps(self):
+        # Some containers need decoded frame timing rather than one PTS per packet.
+        self.fastPackets = False
+        self.times = []
+        self.firstTime = None
+        self.imageCache.clear()
+        self.cacheBytes = 0
+        self._queryWindow(self.stepping[2] if self.stepping else None)
+
+    def _remember(self, seconds, image, end, nextPts):
+        if seconds in self.imageCache:
+            self.cacheBytes -= self.imageCache.pop(seconds)[0].byteCount()
+        self.imageCache[seconds] = (image, end, nextPts)
+        self.cacheBytes += image.byteCount()
+        while self.cacheBytes > 24 * 1024 * 1024 or len(self.imageCache) > 48:
+            old, entry = self.imageCache.popitem(last=False)
+            self.cacheBytes -= entry[0].byteCount()
+
+    def _cached(self, seconds):
+        candidate = None
+        for pts, entry in self.imageCache.items():
+            image, end, nextPts = entry
+            inside = pts <= seconds + 0.000051 and end is not None and seconds + 0.000051 < end
+            if inside or (pts == self.firstTime and seconds < pts) or abs(pts - seconds) <= 0.000051:
+                if candidate is None or pts > candidate:
+                    candidate = pts
+        if candidate is None:
+            return False
+        image, end, nextPts = self.imageCache.pop(candidate)
+        self.imageCache[candidate] = (image, end, nextPts)
+        if self.command is not None or self.delay.isActive():
+            self.cancelCurrent()
+        self.desired = seconds
+        if candidate != self.shown:
+            self.shown = candidate
+            self.frameReady.emit(candidate, image)
+        return True
+
+    def _finishDecode(self, data):
+        images = []
+        for bitmap in timeline.bitmapFrames(data, len(self.batchTimes)):
+            image = QtGui.QImage.fromData(bitmap, 'BMP')
+            if image.isNull():
+                raise ValueError('The video reader returned no valid image.')
+            self.previewBytes = max(self.previewBytes if self.shown is not None else 0,
+                                    image.width() * image.height() * 4 + 1024)
+            images.append(image)
+        if len(images) != len(self.batchTimes):
+            raise ValueError('Video packet timing did not match decoded images.')
+        for pts, image in zip(self.batchTimes, images):
+            index = timeline.frameAtTime(self.times, pts + self.origin)
+            nextPts = self.times[index + 1] - self.origin if index + 1 < len(self.times) else None
+            end = nextPts if nextPts is not None else self.windowEnd
+            if nextPts is None and self.duration and self.windowEnd >= self.duration:
+                end = self.duration + 0.0001
+            self._remember(pts, image, end if end > pts else None, nextPts)
+        self.details = ''
+        self.phase, self.message = 'ready', ''
+        if not self._cached(self.desired):
+            self.delay.start()
+
+    def requestTime(self, seconds):
+        if not self.ready or self.closed or self.cancelled:
+            return
+        seconds = max(0.0, seconds)
+        if self.duration:
+            seconds = min(seconds, self.duration)
+        previous = self.desired if self.desired is not None else self.shown
+        if previous is not None:
+            self.forward = seconds >= previous
+        if self._cached(seconds):
+            return
+        target = seconds + self.origin
+        source = None
+        if self.times and self.times[0] <= target <= self.times[-1] + 0.000051:
+            source = self.times[timeline.frameAtTime(self.times, target)] - self.origin
+        if self.phase == 'decode' and source in self.batchTimes:
+            self.active, self.desired = source, seconds
+            return
+        if self.phase == 'decode' and abs(seconds - self.active) <= 0.5:
+            self.desired = seconds
+            return
+        if self.phase == 'window' and self.probeBounds[0] <= seconds <= self.probeBounds[1]:
+            self.desired = seconds
+            return
+        if self.command is None and self.delay.isActive():
+            self.desired = seconds
+            return
+        if self.desired is not None and abs(seconds - self.desired) < 0.000001:
+            return
+        self.cancelCurrent()
+        self.desired = seconds
+        self.delay.start()
+
+    def _seek(self):
+        if self.desired is None or self.closed:
+            return
+        target = self.origin + self.desired
+        if self.times and self.times[0] <= target <= self.times[-1] + 0.000051:
+            self._decode()
+        else:
+            self._queryWindow()
+
+    def _queryWindow(self, span=None):
+        seconds = self.stepping[1] - self.origin if self.stepping else self.desired
+        ahead = max(2.0, 32.0 / self.fps) if self.fastPackets else max(0.5, 2.0 / self.fps)
+        self.windowStart = seconds - (span if span is not None else max(2.0, 32.0 / self.fps))
+        self.windowEnd = seconds + (span if span is not None else ahead)
+        self.probeBounds = (seconds, seconds + min(0.5, ahead / 2))
+        self.batchTimes = []
+        self.message = u'Reading video timing...'
+        self._launch('ffprobe', timeline.windowArguments(self.filename,
+            self.origin, seconds, self.fps, span, self.fastPackets), 'window', 4194304)
+
+    def _decode(self):
+        index = timeline.frameAtTime(self.times, self.desired + self.origin)
+        self.active = max(0.0, self.times[index] - self.origin)
+        jump = self.shown is None or abs(self.desired - self.shown) > 0.5
+        count = 1 if jump else min(self.batchLimit, max(1, (15 * 1024 * 1024) // self.previewBytes))
+        first = index if self.forward else max(0, index - count + 1)
+        last = min(len(self.times), first + count)
+        self.batchTimes = [max(0.0, pts - self.origin) for pts in self.times[first:last]]
+        raw = self.times[first]
+        anchor = timeline.findSeekAnchor(self.keyPts, self.keyDts, raw)
+        self.message = u'Reading video frames...'
+        self._launch('ffmpeg', timeline.decodeArguments(self.filename, raw, anchor,
+            self.fileOrigin, len(self.batchTimes)), 'decode', 16777216)
+
+    def step(self, direction):
+        if self.shown is None:
+            return
+        self.forward = direction > 0
+        if direction > 0 and self.shown in self.imageCache:
+            end = self.imageCache[self.shown][2]
+            if end is not None and (not self.duration or end < self.duration):
+                self.requestTime(end)
+                return
+        if direction < 0:
+            for pts, entry in self.imageCache.items():
+                if entry[2] is not None and abs(entry[2] - self.shown) < 0.000051:
+                    self.requestTime(pts)
+                    return
+        target = self.shown + self.origin
+        if self.times and self.times[0] <= target <= self.times[-1] + 0.000051:
+            index = timeline.frameAtTime(self.times, target)
+            adjacent = index + direction
+            if 0 <= adjacent < len(self.times):
+                self.requestTime(self.times[adjacent] - self.origin)
+                return
+        self.cancelCurrent()
+        self.stepping = (direction, target, max(2.0, 32.0 / self.fps))
+        self._stepWindow()
+
+    def _stepWindow(self):
+        self._queryWindow(self.stepping[2])
+
+    def cancelCurrent(self):
+        self.delay.stop()
+        self.poll.stop()
+        if self.command is not None:
+            self.command.cancel()
+            self.command = None
+        if self.ready:
+            self.phase = 'ready'
+        self.message = ''
+        self.desired = None
+        self.stepping = None
+
+    def _fail(self, message):
+        self.cancelCurrent()
+        self.cancelled = True
+        self.ready = False
+        self.phase = 'error'
+        self.message = message
+        if self.details:
+            print('[ReFrame] ' + self.details.encode('ascii', 'replace'))
+        self.failed.emit(message)
+
+    def close(self):
+        self.closed = True
+        if self.command is not None:
+            self.command.close()
+        self.cancelCurrent()
+        self.imageCache.clear()
+        self.cacheBytes = 0
+
+
+# == Reference window === #
+class ReFrameWindow(QtGui.QWidget):
+    def __init__(self):
+        parent = sfmWindowParent()
+        flags = QtCore.Qt.Window
+        if parent is None:
+            flags |= QtCore.Qt.WindowStaysOnTopHint
+        super(ReFrameWindow, self).__init__(parent, flags)
+        self.setObjectName(InternalName)
+        self.setWindowTitle(ProductName)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        self.resize(720, 548)
+        self.setMinimumSize(500, 320)
+        self.reader = None
+        self.alignments = {}
+        self.session = None
+        self.closed = False
+        self.displayed = None
+        self.overlayHandle = None
+        self.mediaSummary = ''
+        self.helpWindow = None
+        self.shotClock = ShotClock()
+        self.surface = VideoSurface(self)
+        self.fileLabel = ElidedLabel(u'No video selected')
+        self.fileLabel.setAccessibleName(u'Reference filename')
+        self.status = ElidedLabel(u'Open a video')
+        self.status.setObjectName('Muted')
+        self.openButton = iconButton('open', u'Open video (Ctrl+O)', u'Choose a local video reference.')
+        self.closeButton = iconButton('close', u'Close video', u'Unload the reference and release its reader.')
+        self.infoButton = iconButton('info', u'Video information (Ctrl+I)', u'View file details or the last decoder error.')
+        self.helpButton = iconButton('help', u'ReFrame controls', u'View the workflow and keyboard shortcuts.')
+        self.follow = iconButton('follow', u'Follow SFM playhead (F)',
+            u'On: follow the current shot. Off: choose a reference pose manually.', True)
+        self.follow.setChecked(True)
+        self.align = iconButton('align', u'Align to playhead (A)',
+            u'Match the displayed pose to the SFM playhead and resume following. Wait for the selected image first.')
+        self.reset = iconButton('reset', u'Reset alignment (R)',
+            u'Match the current shot start to video time zero and resume following.')
+        self.first = iconButton('first', u'First frame (Home)', u'Pause following and go to the video start.')
+        self.previous = iconButton('previous', u'Previous frame (Left)', u'Pause following and step back one actual video frame.')
+        self.next = iconButton('next', u'Next frame (Right)', u'Pause following and step forward one actual video frame.')
+        self.last = iconButton('last', u'Last frame (End)', u'Pause following and go to the video end.')
+        self.mirror = iconButton('mirror', u'Mirror horizontally (M)', u'Flip the view without changing the file or its timing.', True)
+        self.fit = iconButton('fit', u'Fit video (0)', u'Reset zoom and pan. You can also double-click the image.')
+        self.focusView = iconButton('focus', u'Focus view (Ctrl+Space)',
+            u'Hide the controls to use more space for the reference. Press Esc or reopen ReFrame to restore them.', True)
+        self.seek = VideoSlider(self)
+        self.seek.setAccessibleName(u'Video timeline')
+        self.seek.setToolTip(u'Video timeline')
+        self.startLabel = QtGui.QLabel('00:00:00.000')
+        self.endLabel = QtGui.QLabel('00:00:00.000')
+        for label in (self.startLabel, self.endLabel):
+            label.setObjectName('Muted')
+            label.setFixedWidth(84)
+        self.startLabel.setToolTip(u'Video time')
+        self.endLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.endLabel.setToolTip(u'Video duration')
+        self.position = QtGui.QLineEdit(u'--')
+        self.position.setObjectName('ShotTime')
+        self.position.setReadOnly(True)
+        self.position.setCursor(QtCore.Qt.ArrowCursor)
+        self.position.setFixedSize(120, 30)
+        self.position.setAlignment(QtCore.Qt.AlignCenter)
+        self.position.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.position.setToolTip(u'SFM local shot time')
+        self.position.setAccessibleName(u'SFM local shot time')
+        self.opacity = QtGui.QSlider(QtCore.Qt.Horizontal)
+        self.opacity.setRange(20, 100)
+        self.opacity.setValue(100)
+        self.opacity.setToolTip(u'Window opacity')
+        self.opacity.setAccessibleName(u'Window opacity')
+        self.opacityLabel = QtGui.QLabel(u'100%')
+        self.opacityLabel.setFixedWidth(30)
+        self.opacityLabel.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.clicks = iconButton('clicks', u'Pass clicks to viewport',
+            u'Let clicks pass through ReFrame. A separate Restore controls window stays clickable.', True)
+        self.zoomLabel = QtGui.QLabel(u'Fit')
+        self.zoomLabel.setObjectName('Muted')
+        self.zoomLabel.setFixedWidth(160)
+        self.zoomLabel.setToolTip(u'View zoom')
+
+        self.header = QtGui.QWidget()
+        row = QtGui.QHBoxLayout(self.header)
+        row.addWidget(self.openButton)
+        row.addWidget(self.closeButton)
+        row.addWidget(self.fileLabel, 1)
+        row.addWidget(self.infoButton)
+        row.addWidget(self.helpButton)
+        self.timelineBar = QtGui.QWidget()
+        row = QtGui.QHBoxLayout(self.timelineBar)
+        row.addWidget(self.startLabel)
+        row.addWidget(self.seek, 1)
+        row.addWidget(self.endLabel)
+        self.controls = QtGui.QWidget()
+        row = QtGui.QHBoxLayout(self.controls)
+        self.syncGroup = QtGui.QWidget()
+        syncLayout = QtGui.QHBoxLayout(self.syncGroup)
+        for button in (self.follow, self.align, self.reset):
+            syncLayout.addWidget(button)
+        self.transport = QtGui.QWidget()
+        transportLayout = QtGui.QHBoxLayout(self.transport)
+        for widget in (self.first, self.previous, self.position, self.next, self.last):
+            transportLayout.addWidget(widget)
+        self.viewGroup = QtGui.QWidget()
+        viewLayout = QtGui.QHBoxLayout(self.viewGroup)
+        for button in (self.mirror, self.fit, self.focusView):
+            viewLayout.addWidget(button)
+        row.addWidget(self.syncGroup)
+        row.addStretch(1)
+        row.addWidget(self.transport)
+        row.addStretch(1)
+        row.addWidget(self.viewGroup)
+        self.footer = QtGui.QWidget()
+        row = QtGui.QHBoxLayout(self.footer)
+        row.addWidget(self.zoomLabel)
+        row.addWidget(self.status, 1)
+        overlay = QtGui.QWidget()
+        overlay.setFixedWidth(160)
+        overlayLayout = QtGui.QHBoxLayout(overlay)
+        opacityIcon = QtGui.QLabel()
+        opacityIcon.setPixmap(makeIcon('opacity').pixmap(16, 16))
+        opacityIcon.setToolTip(self.opacity.toolTip())
+        overlayLayout.addWidget(opacityIcon)
+        overlayLayout.addWidget(self.opacity, 1)
+        overlayLayout.addWidget(self.opacityLabel)
+        overlayLayout.addWidget(self.clicks)
+        row.addWidget(overlay)
+        for widget in (self.header, self.timelineBar, self.controls, self.footer,
+                       self.syncGroup, self.transport, self.viewGroup, overlay):
+            widget.layout().setContentsMargins(0, 0, 0, 0)
+            widget.layout().setSpacing(4)
+        layout = QtGui.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        layout.addWidget(self.header)
+        layout.addWidget(self.surface, 1)
+        layout.addWidget(self.timelineBar)
+        layout.addWidget(self.controls)
+        layout.addWidget(self.footer)
+        self.chrome = (self.header, self.timelineBar, self.controls, self.footer)
+        self.openButton.clicked.connect(self._chooseVideo)
+        self.surface.openRequested.connect(self._chooseVideo)
+        self.closeButton.clicked.connect(self._closeVideo)
+        self.infoButton.clicked.connect(self._showInfo)
+        self.helpButton.clicked.connect(self._showHelp)
+        self.follow.toggled.connect(self._onFollowChanged)
+        self.seek.sliderPressed.connect(self._pauseFollowing)
+        self.seek.valueChanged.connect(self._scrub)
+        self.first.clicked.connect(lambda: self._seekTime(0))
+        self.last.clicked.connect(lambda: self._seekTime(self.reader.duration))
+        self.previous.clicked.connect(lambda: self._stepFrame(-1))
+        self.next.clicked.connect(lambda: self._stepFrame(1))
+        self.align.clicked.connect(self._alignToPlayhead)
+        self.reset.clicked.connect(self._resetAlignment)
+        self.mirror.toggled.connect(self.surface.setMirrored)
+        self.fit.clicked.connect(self.surface.fit)
+        self.focusView.toggled.connect(self._setFocusView)
+        self.surface.zoomChanged.connect(self._showZoom)
+        self.opacity.valueChanged.connect(self._setOpacity)
+        self.clicks.toggled.connect(self._setClickThrough)
+        self.shortcuts, self.navigationShortcuts = [], []
+        bindings = [('Ctrl+O', self._chooseVideo), ('Ctrl+I', self._showInfo),
+                    ('Ctrl+W', self._closeVideo), ('F1', self._showHelp),
+                    ('Ctrl+Space', self.focusView.click), ('Esc', self._escape),
+                    ('F', self.follow.click), ('A', self.align.click), ('R', self.reset.click),
+                    ('M', self.mirror.click), ('0', self.fit.click),
+                    ('Left', lambda: self._stepFrame(-1)), ('Right', lambda: self._stepFrame(1)),
+                    ('Home', self.first.click), ('End', self.last.click)]
+        for key, callback in bindings:
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            shortcut.setAutoRepeat(key in ('Left', 'Right'))
+            shortcut.activated.connect(callback)
+            self.shortcuts.append(shortcut)
+            if key in ('Left', 'Right', 'Home', 'End'):
+                self.navigationShortcuts.append(shortcut)
+        self.timer = QtCore.QTimer(self)
+        self.timer.setInterval(60)
+        self.timer.timeout.connect(self._pollPlayhead)
+        QtGui.QApplication.instance().aboutToQuit.connect(self.shutdown)
+        applyWindowStyle(self)
+        self.tip = TitleTip(self)
+        self.installTitleTips(self)
+        self.timer.start()
+        self._syncControls()
+
+    def _chooseVideo(self):
+        filename, unused = QtGui.QFileDialog.getOpenFileName(self, u'Open reference', '',
+            u'Video files (*.mp4 *.m4v *.mov *.mkv *.webm *.avi *.wmv *.mpg *.mpeg *.m2v *.ts *.mts *.m2ts *.flv *.ogv *.mxf);;All files (*)')
+        if filename:
+            self.loadVideo(filename)
+
+    def loadVideo(self, filename):
+        self._closeVideo()
+        self.fileLabel.setText(os.path.basename(filename))
+        self.reader = VideoReader(self)
+        self.reader.opened.connect(self._onVideoOpened)
+        self.reader.frameReady.connect(self._showFrame)
+        self.reader.failed.connect(self._showError)
+        self._syncControls()
+        self.status.setText(u'Opening video...')
+        self.reader.open(filename)
+
+    def _closeVideo(self):
+        self.restoreControls()
+        if self.reader is not None:
+            self.reader.close()
+            self.reader.deleteLater()
+            self.reader = None
+        self.alignments.clear()
+        self.session = None
+        self.displayed = None
+        self.surface.image = QtGui.QImage()
+        self.surface.fit()
+        self.mirror.setChecked(False)
+        self.fileLabel.setText(u'No video selected')
+        self.mediaSummary = ''
+        self.seek.duration = 0.0
+        self.endLabel.setText('00:00:00.000')
+        self._setPosition(0)
+        self.follow.setChecked(True)
+        self._syncControls()
+        self.status.setText(u'Open a video')
+        self.setWindowTitle(ProductName)
+
+    def _onVideoOpened(self):
+        info = self.reader.info
+        self.seek.duration = self.reader.duration
+        self.endLabel.setText(timeline.timeLabel(self.reader.duration))
+        self.mediaSummary = u'%d x %d | %.3g fps | %s\nDuration: %s' % (
+            info['width'], info['height'], self.reader.fps, info['codec'].upper(),
+            timeline.timeLabel(self.reader.duration))
+        self.reader.requestTime(0)
+        self._pollPlayhead()
+
+    def _showFrame(self, seconds, image):
+        self.displayed = seconds
+        self.surface.image = image
+        self.surface.update()
+        self._setPosition(seconds)
+        self._syncControls()
+
+    def _showError(self, message):
+        self._syncControls()
+        self.status.setText(message)
+        QtGui.QMessageBox.warning(self, ProductName, message)
+
+    def _showInfo(self):
+        if not self.reader or not self.infoButton.isEnabled():
+            return
+        if self.reader.details:
+            self._showDetails()
+            return
+        box = QtGui.QMessageBox(self)
+        box.setWindowTitle(u'Video information')
+        box.setIcon(QtGui.QMessageBox.Information)
+        box.setTextFormat(QtCore.Qt.PlainText)
+        box.setText(os.path.basename(self.reader.filename))
+        box.setInformativeText(self.mediaSummary + u'\n\n' + self.reader.filename)
+        applyWindowStyle(box)
+        box.exec_()
+
+    def _showHelp(self):
+        if self.helpWindow is None:
+            self.helpWindow = ControlsDialog(self)
+            self.installTitleTips(self.helpWindow)
+        self.helpWindow.showNormal()
+        self.helpWindow.raise_()
+        self.helpWindow.activateWindow()
+
+    def _showDetails(self):
+        if self.reader and self.reader.details:
+            box = QtGui.QMessageBox(self)
+            box.setWindowTitle(ProductName)
+            box.setIcon(QtGui.QMessageBox.Warning)
+            box.setText(u'The video reader could not complete this request.')
+            box.setInformativeText(u'Try another local copy or a supported codec. Copy these details when reporting the problem.')
+            box.setDetailedText(self.reader.details)
+            box.exec_()
+
+    def _syncControls(self):
+        ready = self.reader is not None and self.reader.ready
+        manual = ready and not self.follow.isChecked()
+        self.first.setEnabled(ready)
+        self.position.setEnabled(self.session is not None)
+        for widget in (self.previous, self.next):
+            widget.setEnabled(ready and self.displayed is not None)
+        for widget in (self.seek, self.last):
+            widget.setEnabled(ready and self.reader.duration > 0)
+        for widget in (self.mirror, self.fit, self.focusView):
+            widget.setEnabled(self.displayed is not None)
+        settled = self.reader and self.reader.command is None and not self.reader.delay.isActive()
+        self.align.setEnabled(bool(manual and self.displayed is not None and self.session is not None and settled))
+        self.reset.setEnabled(ready and self.session is not None)
+        self.follow.setEnabled(bool(self.reader and self.reader.ready))
+        self.infoButton.setEnabled(bool(self.reader and (self.reader.info or self.reader.details)))
+        self.closeButton.setEnabled(self.reader is not None)
+        interval = 16 if ready and self.follow.isChecked() else (60 if ready else 200)
+        if self.timer.interval() != interval:
+            self.timer.setInterval(interval)
+
+    def _onFollowChanged(self, checked):
+        if self.reader and not checked:
+            self.reader.cancelCurrent()
+            if self.displayed is not None:
+                self._setPosition(self.displayed)
+        self._pollPlayhead()
+
+    def _setPosition(self, seconds):
+        self.startLabel.setText(timeline.timeLabel(seconds))
+        self.seek.blockSignals(True)
+        duration = self.reader.duration if self.reader else 0
+        self.seek.setValue(int(100000 * seconds / duration) if duration else 0)
+        self.seek.blockSignals(False)
+
+    def _scrub(self, value):
+        if self.reader and self.reader.ready:
+            self._seekTime(self.reader.duration * value / 100000.0)
+            self.seek.blockSignals(True)
+            self.seek.setValue(value)
+            self.seek.blockSignals(False)
+
+    def _seekTime(self, seconds):
+        if self.reader and self.reader.ready:
+            self._pauseFollowing()
+            self.reader.requestTime(seconds)
+            self._syncControls()
+
+    def _pauseFollowing(self):
+        if self.reader and self.reader.ready:
+            self.follow.setChecked(False)
+
+    def _stepFrame(self, direction):
+        if self.reader and self.reader.ready and self.displayed is not None:
+            self._pauseFollowing()
+            self.reader.step(direction)
+            self._syncControls()
+
+    def installTitleTips(self, widget):
+        for child in [widget] + widget.findChildren(QtGui.QWidget):
+            if child is not self.tip:
+                child.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QtCore.QEvent.ToolTip:
+            if watched is not self.surface and watched.toolTip():
+                self.tip.showTitle(watched.toolTip(), event.globalPos())
+            else:
+                self.tip.dismiss()
+            return True
+        if event.type() in (QtCore.QEvent.Leave, QtCore.QEvent.MouseButtonPress,
+                            QtCore.QEvent.Hide, QtCore.QEvent.WindowDeactivate):
+            self.tip.dismiss()
+        if watched is self.opacity and event.type() in (QtCore.QEvent.FocusIn, QtCore.QEvent.FocusOut):
+            editing = event.type() == QtCore.QEvent.FocusIn
+            for shortcut in self.navigationShortcuts:
+                shortcut.setEnabled(not editing)
+        return super(ReFrameWindow, self).eventFilter(watched, event)
+
+    def _showZoom(self, zoom):
+        self.zoomLabel.setText(u'Fit' if zoom == 1 else u'%d%%' % round(zoom * 100))
+
+    def _setFocusView(self, enabled):
+        self.tip.dismiss()
+        for widget in self.chrome:
+            widget.setVisible(not enabled)
+        self.surface.setFocus()
+
+    def restoreControls(self):
+        self.clicks.setChecked(False)
+        self.focusView.setChecked(False)
+        if not self.closed:
+            self.raise_()
+            self.activateWindow()
+
+    def _escape(self):
+        if self.focusView.isChecked() or self.clicks.isChecked():
+            self.restoreControls()
+
+    def _pollPlayhead(self):
+        if self.closed:
+            return
+        try:
+            self.session = timeline.readSessionTime(sfmApp)
+        except Exception as error:
+            self.session = None
+            self.position.setText(u'--')
+            self.status.setText(u'Could not read SFM time: %s' % error)
+            if self.reader and self.reader.ready and self.follow.isChecked():
+                if self.displayed is None:
+                    self.reader.requestTime(0)
+                else:
+                    self.reader.cancelCurrent()
+            self._syncControls()
+            return
+        text = self.shotClock.read(self.session)
+        if text != self.position.text():
+            self.position.setText(text)
+        ready = self.reader is not None and self.reader.ready
+        self._syncControls()
+        if not ready:
+            if self.reader and self.reader.message:
+                self.status.setText(self.reader.message)
+            return
+        if self.session is None:
+            self.status.setText(u'Waiting for an SFM shot' if self.follow.isChecked() else u'Choose a pose, then Align')
+            self.status.setToolTip(u'Synchronization status')
+            if self.follow.isChecked():
+                if self.displayed is None:
+                    self.reader.requestTime(0)
+                else:
+                    self.reader.cancelCurrent()
+            return
+        key, head, start, fps = self.session
+        mapping = self.alignments.setdefault(key, timeline.Alignment())
+        if self.follow.isChecked():
+            self.reader.requestTime(mapping.target(head, start))
+        mode = u'Following SFM' if self.follow.isChecked() else u'Choose a pose, then Align'
+        if self.follow.isChecked() and mapping.offset:
+            mode += u' | Aligned'
+        slow = self.reader.command is not None and time.time() - self.reader.started > 0.35
+        self.status.setText(self.reader.message if slow and self.reader.message else mode)
+        self.status.setToolTip(u'Synchronization status')
+
+    def _alignToPlayhead(self):
+        self._pollPlayhead()
+        if self.session is None or self.displayed is None or not self.align.isEnabled():
+            return
+        key, head, start, fps = self.session
+        self.alignments[key].align(head, start, self.displayed)
+        self.follow.setChecked(True)
+
+    def _resetAlignment(self):
+        self._pollPlayhead()
+        if self.session is not None:
+            self.alignments[self.session[0]].reset()
+            self.follow.setChecked(True)
+            self._pollPlayhead()
+
+    def _setOpacity(self, value):
+        self.opacityLabel.setText(u'%d%%' % value)
+        opacity = value / 100.0
+        if self.clicks.isChecked():
+            opacity = min(opacity, 0.99)
+        self.setWindowOpacity(opacity)
+
+    def _setClickThrough(self, enabled):
+        import ctypes
+        user32 = ctypes.windll.user32
+        hwnd = nativeWindowHandle(self)
+        if enabled:
+            # A separate native window remains clickable even over SFM's viewport.
+            if self.overlayHandle is None:
+                self.overlayHandle = OverlayHandle(self)
+            self.overlayHandle.move(self.pos())
+            self.overlayHandle.show()
+            self.overlayHandle.raise_()
+        self._setOpacity(self.opacity.value())
+        style = user32.GetWindowLongW(hwnd, -20)
+        style = style | 0x80020 if enabled else style & ~0x20
+        user32.SetWindowLongW(hwnd, -20, style)
+        if enabled and not user32.GetWindowLongW(hwnd, -20) & 0x20:
+            self.clicks.setChecked(False)
+            QtGui.QMessageBox.warning(self, ProductName, u'Windows could not enable click-through.')
+        if not enabled and self.overlayHandle:
+            self.overlayHandle.hide()
+            if not self.closed:
+                self.raise_()
+                self.activateWindow()
+
+    def shutdown(self):
+        global _window
+        if self.closed:
+            return
+        self.closed = True
+        self.tip.dismiss()
+        if self.helpWindow:
+            self.helpWindow.close()
+        self.clicks.setChecked(False)
+        if self.overlayHandle:
+            self.overlayHandle.hide()
+            self.overlayHandle.deleteLater()
+            self.overlayHandle = None
+        self.timer.stop()
+        if self.reader:
+            self.reader.close()
+        self.alignments.clear()
+        if _window is self:
+            _window = None
+
+    def closeEvent(self, event):
+        self.shutdown()
+        event.accept()
+
+
+# -- Opens or focuses the reference window --- #
+
+def showReFrame():
+    global _window
+    if _window is None:
+        _window = ReFrameWindow()
+    _window.restoreControls()
+    _window.showNormal()
+    _window.raise_()
+    _window.activateWindow()
